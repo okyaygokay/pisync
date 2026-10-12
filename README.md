@@ -43,7 +43,7 @@ A master that spawns workers and waits for them would hold the slot while idle, 
 1. **Discovery.** On start the extension exports `PISYNC_PARENT_ID=<its agent id>` into its own process environment. Anything it spawns (bash tool, `child_process`, RPC children, nested `pi -p`) inherits that variable, so the child's extension registers itself as a child of the master, to any depth. If your orchestrator launches workers some other way, set the variables yourself:
    * `PISYNC_SELF_ID=master-1` — fixed id for this pi process (removed from the env so it is not inherited)
    * `PISYNC_PARENT_ID=master-1` — declare the parent of this pi process
-2. **Yield.** If the active task is *idle* (no request pending or in flight, e.g. it is blocked on a tool waiting for its workers) and one of its descendants is queued, the master is **suspended**: it gives up the slot, the queue continues in FIFO order, and the master's next request puts it back in the queue (at the **front** by default, see `queue.parentResume`) once the workers are done. A master that is mid-request never yields.
+2. **Yield.** If the active task is *idle* (no request pending or in flight, e.g. it is blocked on a tool waiting for its workers) and one of its descendants is queued, the master is **suspended**: it gives up the slot, the queue continues in FIFO order, and the master's next request puts it back in the queue (ahead of anyone who arrives later by default - at the **front** - see `queue.parentResume`; agents already waiting keep their turn) once the workers are done. A master that is mid-request never yields.
 
 ### Failures, retries, timeouts
 
@@ -64,28 +64,21 @@ A master that spawns workers and waits for them would hold the slot while idle, 
 
 ## Install
 
-Requires Node ≥ 22.19 (same as pi).
+One command (Node ≥ 22.19, same as pi):
 
 ```bash
-git clone <this repo> && cd pisync
-npm install && npm run build
-
-cp pisync.config.example.json pisync.config.json   # adjust, see below
-node dist/src/cli.js start                          # or: npm link && pisyncd
+pi install git:github.com/okyaygokay/pisync
 ```
 
-Load the extension in every pi that should take part (all of them, including sub-agents):
+That is all. The extension starts `pisyncd` in the background the first time a pi needs it (detached, logs to `~/.pisync/daemon.log`) and every other pi on the machine shares that one daemon. No build step, no config file required: defaults route `anthropic`, `openai-codex` and `openai` through the daemon.
 
-```bash
-pi install /path/to/pisync                 # as a pi package (package.json -> "pi.extensions")
-# or one-off:
-pi -e /path/to/pisync/extension/index.ts
-# or drop a symlink into ~/.pi/agent/extensions/pisync/index.ts
-```
+Make sure the extension is loaded by **every** pi that takes part, sub-agents included (a user-level install covers all of them). To remove it: `pi remove git:github.com/okyaygokay/pisync`; to stop the daemon: `pkill -f "pisyncd|cli.ts start"` or `kill $(pisyncd status | jq .pid)`.
+
+Optional: copy `pisync.config.example.json` to `~/.config/pisync/config.json` (or `./pisync.config.json`) to change limits, retries, upstreams or the port. Set `"autoStart": false` if you prefer to run the daemon yourself (`node dist/src/cli.js start` after `npm install && npm run build`, or `npm link` for a `pisyncd` command).
 
 Config lookup (daemon and extension, first hit wins): `--config`, `$PISYNC_CONFIG`, `./pisync.config.json`, `~/.config/pisync/config.json`, `~/.pi/agent/pisync.json`. `pisyncd print-config` shows the effective values; invalid configs are rejected with a list of every problem.
 
-Other env vars (extension): `PISYNC_URL` (daemon URL override), `PISYNC_DISABLE=1`, `PISYNC_LABEL`.
+Other env vars (extension): `PISYNC_URL` (daemon URL override), `PISYNC_DISABLE=1`, `PISYNC_NO_AUTOSTART=1`, `PISYNC_LABEL`, `PISYNC_OUTAGE_MS` (how long to wait for an unreachable daemon before aborting the run; default 30000).
 
 > If you use `HTTP_PROXY` for plain HTTP, add `127.0.0.1` to `NO_PROXY` so pi can reach the daemon.
 > When spawning pi in print mode (`pi -p`) from a script, close its stdin (`< /dev/null` / `stdio: "ignore"`), otherwise pi waits for piped input.
@@ -116,7 +109,7 @@ Any client can use `http://127.0.0.1:7878/<upstream>/…` (e.g. `…/anthropic/v
 ## Development
 
 ```bash
-npm test            # ~150 tests: scheduler, proxy, retries, config, extension, CLI, real pi processes
+npm test            # ~180 tests: unit, daemon/proxy, and ~30 end-to-end tests that drive real pi processes
 npm run typecheck
 npm run build
 ```

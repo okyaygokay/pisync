@@ -15,6 +15,7 @@ beforeEach(async () => {
   delete process.env.PISYNC_PARENT_ID;
   delete process.env.PISYNC_SELF_ID;
   delete process.env.PISYNC_DISABLE;
+  process.env.PISYNC_NO_AUTOSTART = "1";
 });
 afterEach(async () => {
   await ctx.daemon.close(100);
@@ -233,6 +234,23 @@ describe("client", () => {
     await control(ctx.base, "acquire", { agentId: "hb" }); // self-heal path also works
     expect(ctx.daemon.scheduler.hasAgent("hb")).toBe(true);
     await c.stop();
+  });
+
+  it("treats a shutting-down daemon (503 shutdown) as an outage, not a failure", async () => {
+    let n = 0;
+    const f: typeof fetch = (input, init) => {
+      if (String(input).endsWith("/acquire") && ++n <= 2)
+        return Promise.resolve(new Response(JSON.stringify({ error: "shutdown", message: "scheduler closed" }), { status: 503 }));
+      return fetch(input, init);
+    };
+    const c = new PisyncClient({ baseUrl: ctx.base, agentId: "restarting", fetch: f, retryDelayMs: 5 });
+    await c.acquire();
+    expect(n).toBe(3);
+  });
+
+  it("gives up with daemon_unreachable after maxOutageMs instead of hanging forever", async () => {
+    const c = new PisyncClient({ baseUrl: "http://127.0.0.1:1", agentId: "lost", retryDelayMs: 10, maxOutageMs: 80 });
+    await expect(c.acquire()).rejects.toMatchObject({ code: "daemon_unreachable" });
   });
 
   it("surfaces expiry as an AcquireError", async () => {

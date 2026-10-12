@@ -11,6 +11,7 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { PisyncClient, newAgentId } from "../src/client.ts";
+import { ensureDaemon } from "../src/autostart.ts";
 import { loadConfig } from "../src/config.ts";
 
 /** Children spawned by this process inherit this and become our sub-agents. */
@@ -24,8 +25,11 @@ export default function pisync(pi: ExtensionAPI) {
   if (process.env[DISABLE_ENV]) return;
 
   let cfg;
+  let cfgPath: string | null = null;
   try {
-    cfg = loadConfig().config;
+    const loaded = loadConfig();
+    cfg = loaded.config;
+    cfgPath = loaded.path;
   } catch (e) {
     // Never take pi down because of our config.
     console.error(`[pisync] disabled: ${(e as Error).message}`);
@@ -53,6 +57,7 @@ export default function pisync(pi: ExtensionAPI) {
       agentId,
       parentId,
       pid: process.pid,
+      ...(process.env.PISYNC_OUTAGE_MS ? { maxOutageMs: Number(process.env.PISYNC_OUTAGE_MS) } : {}),
       label: process.env.PISYNC_LABEL ?? `pi:${process.cwd().split("/").pop()}`,
       onWaiting: ({ position, queueLength }) => setStatus?.(`pisync: waiting (#${position} of ${queueLength})`),
       onError: () => {
@@ -62,7 +67,7 @@ export default function pisync(pi: ExtensionAPI) {
     return client;
   };
 
-  const acquire = async (ctx: { signal?: AbortSignal; ui: { setStatus(k: string, t: string | undefined): void; notify(m: string, t?: "info" | "warning" | "error"): void } }) => {
+  const acquire = async (ctx: { signal?: AbortSignal; abort?: () => void; ui: { setStatus(k: string, t: string | undefined): void; notify(m: string, t?: "info" | "warning" | "error"): void } }) => {
     setStatus = (t) => ctx.ui.setStatus("pisync", t);
     try {
       await ensureClient().acquire(ctx.signal);
@@ -72,6 +77,9 @@ export default function pisync(pi: ExtensionAPI) {
       const code = (e as { code?: string }).code;
       if (code === "aborted") return;
       ctx.ui.notify(`pisync: ${(e as Error).message}`, "error");
+      // The queue refused this task (wait limit / hard limit): stop the run instead of
+      // letting its requests quietly re-queue and defeat the limit.
+      ctx.abort?.();
       throw e;
     }
   };
@@ -81,9 +89,10 @@ export default function pisync(pi: ExtensionAPI) {
     // Sub-agents spawned from here on (bash, subprocesses, RPC children...) inherit this.
     process.env[PARENT_ENV] = agentId;
     try {
+      if (cfg.autoStart && !process.env.PISYNC_NO_AUTOSTART) await ensureDaemon({ baseUrl, configPath: cfgPath });
       await ensureClient().start();
     } catch (e) {
-      ctx.ui.notify(`pisync: daemon unreachable at ${baseUrl} (${(e as Error).message}). Start it with \`pisyncd\`.`, "warning");
+      ctx.ui.notify(`pisync: daemon unreachable at ${baseUrl} (${(e as Error).message}). Start it with \`pisyncd\` or set "autoStart": true.`, "warning");
     }
   });
 

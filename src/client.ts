@@ -13,6 +13,8 @@ export interface ClientOptions {
   onError?: (err: Error) => void;
   /** Delay between reconnect attempts while the daemon is unreachable. */
   retryDelayMs?: number;
+  /** Give up acquire() after the daemon has been unreachable this long (default 30s). */
+  maxOutageMs?: number;
 }
 
 export class AcquireError extends Error {
@@ -23,6 +25,8 @@ export class AcquireError extends Error {
     this.code = code;
   }
 }
+
+class TransientError extends Error {}
 
 export function newAgentId(prefix = "pi"): string {
   return `${prefix}-${process.pid}-${randomBytes(4).toString("hex")}`;
@@ -91,21 +95,31 @@ export class PisyncClient {
    * daemon restarts. Throws AcquireError on expiry/queue timeout, or if aborted.
    */
   async acquire(signal?: AbortSignal): Promise<void> {
+    let downSince = 0;
     for (;;) {
       if (signal?.aborted || this.stopped) throw new AcquireError("aborted", "acquire aborted");
       try {
         const { status, body } = await this.post("acquire", {}, signal);
+        downSince = 0;
         if (status === 200 && body.granted === true) return;
         if (status === 200) {
           this.o.onWaiting?.({ position: Number(body.position ?? 0), queueLength: Number(body.queueLength ?? 0) });
           continue;
         }
-        throw new AcquireError(String(body.error ?? `http_${status}`), String(body.message ?? `acquire failed: HTTP ${status}`));
+        const code = String(body.error ?? `http_${status}`);
+        // A daemon that is shutting down / lost us is transient: ride it out like a network error.
+        if (code === "shutdown" || code === "agent_gone" || (status >= 500 && !body.error)) throw new TransientError(code);
+        throw new AcquireError(code, String(body.message ?? `acquire failed: HTTP ${status}`));
       } catch (e) {
         if (e instanceof AcquireError) throw e;
+        if (e instanceof TransientError) await Promise.resolve();
         if (signal?.aborted || this.stopped) throw new AcquireError("aborted", "acquire aborted");
         // network error: daemon down / restarting. Wait and retry.
         this.o.onError?.(e as Error);
+        downSince ||= Date.now();
+        if (Date.now() - downSince >= (this.o.maxOutageMs ?? 30_000)) {
+          throw new AcquireError("daemon_unreachable", `pisyncd unreachable at ${this.base} for ${Math.round((Date.now() - downSince) / 1000)}s`);
+        }
         await sleep(this.o.retryDelayMs ?? 1000, signal);
       }
     }

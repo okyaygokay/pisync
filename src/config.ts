@@ -5,6 +5,8 @@ import { join, resolve } from "node:path";
 const HOUR = 3_600_000;
 
 export interface PisyncConfig {
+  /** The pi extension starts a detached pisyncd when none is listening (local URLs only). */
+  autoStart: boolean;
   listen: { host: string; port: number };
   /** pi provider name -> real upstream base URL. Providers listed here are routed through the daemon. */
   upstreams: Record<string, string>;
@@ -59,6 +61,7 @@ export interface PisyncConfig {
 }
 
 export const DEFAULT_CONFIG: PisyncConfig = {
+  autoStart: true,
   listen: { host: "127.0.0.1", port: 7878 },
   upstreams: {
     anthropic: "https://api.anthropic.com",

@@ -237,8 +237,8 @@ export function createDaemon(opts: DaemonOptions): Daemon {
     }
   }
 
-  function status(): { uptimeMs: number; scheduler: SchedulerSnapshot; metrics: Metrics; upstreams: string[] } {
-    return { uptimeMs: Date.now() - startedAt, scheduler: scheduler.snapshot(), metrics, upstreams: [...upstreams.keys()] };
+  function status(): { pid: number; uptimeMs: number; scheduler: SchedulerSnapshot; metrics: Metrics; upstreams: string[] } {
+    return { pid: process.pid, uptimeMs: Date.now() - startedAt, scheduler: scheduler.snapshot(), metrics, upstreams: [...upstreams.keys()] };
   }
 
   return {
