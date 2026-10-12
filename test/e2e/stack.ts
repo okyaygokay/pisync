@@ -205,10 +205,11 @@ export class RpcPi {
   private waiters: Array<(e: any) => void> = [];
   events: any[] = [];
   private nextId = 1;
-  constructor(
-    readonly name: string,
-    readonly proc: ChildProcess,
-  ) {
+  readonly name: string;
+  readonly proc: ChildProcess;
+  constructor(name: string, proc: ChildProcess) {
+    this.name = name;
+    this.proc = proc;
     proc.stdout!.on("data", (d) => {
       this.buf += d;
       let i;
