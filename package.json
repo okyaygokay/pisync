@@ -1,0 +1,43 @@
+{
+  "name": "pisync",
+  "version": "0.1.0",
+  "description": "Task-level request queue daemon and pi extension for single-request-at-a-time subscription plans",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.19"
+  },
+  "bin": {
+    "pisyncd": "dist/src/cli.js"
+  },
+  "files": [
+    "dist/src",
+    "extension",
+    "pisync.config.example.json",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./extension/index.ts"
+    ]
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest --run",
+    "start": "node dist/src/cli.js"
+  },
+  "keywords": ["pi-package", "pi-extension", "proxy", "queue"],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": { "optional": true }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.2.0",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
