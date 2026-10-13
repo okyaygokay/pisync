@@ -7,11 +7,10 @@ import { LinkedQueue } from "../src/linked-queue.ts";
 import { backoffDelay, isRetryableError, parseRetryAfter, retryDelay, sniffRetryableStreamError } from "../src/retry.ts";
 
 describe("config", () => {
-  it("defaults: 25 retries, 3h hard limits, localhost only", () => {
+  it("defaults: 25 retries, 3h task limit, localhost only", () => {
     const c = resolveConfig({});
     expect(c.retry.maxRetries).toBe(25);
     expect(c.task.maxDurationMs).toBe(10_800_000);
-    expect(c.queue.maxWaitMs).toBe(10_800_000);
     expect(c.listen.host).toBe("127.0.0.1");
   });
 
@@ -41,7 +40,8 @@ describe("config", () => {
     [{ upstreams: { a: "not a url" } }, /not a valid URL/],
     [{ upstreams: { a: "ftp://x" } }, /http/],
     [{ queue: { parentResume: "middle" } }, /parentResume/],
-    [{ task: { onMaxDuration: "explode" } }, /onMaxDuration/],
+    [{ queue: { maxWaitMs: 5 } }, /unknown option "queue.maxWaitMs"/],
+    [{ task: { onMaxDuration: "requeue" } }, /unknown option "task.onMaxDuration"/],
     [{ timeouts: { idleMs: 0 } }, /idleMs/],
     [{ agent: { leaseMs: 1000, pollMs: 5000 } }, /pollMs/],
     [{ nonsense: 1 }, /unknown option "nonsense"/],

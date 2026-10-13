@@ -1,6 +1,6 @@
 import http from "node:http";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { control, fakeUpstream, sleep, startDaemon, statusOf, type FakeUpstream } from "./harness.ts";
+import { acquireUntilGranted, control, fakeUpstream, sleep, startDaemon, statusOf, type FakeUpstream } from "./harness.ts";
 
 let up: FakeUpstream;
 let ctx: Awaited<ReturnType<typeof startDaemon>> | undefined;
@@ -166,9 +166,9 @@ describe("single request at a time", () => {
     const base = ctx!.base;
     expect((await control(base, "acquire", { agentId: "a" })).body.granted).toBe(true);
     // b and c ask for the slot (long poll) and queue up
-    const bAcq = control(base, "acquire", { agentId: "b" });
+    const bAcq = acquireUntilGranted(base, "b");
     await sleep(10);
-    const cAcq = control(base, "acquire", { agentId: "c" });
+    const cAcq = acquireUntilGranted(base, "c");
     // a makes several requests; b/c requests are blocked meanwhile
     const bReq = post("/a/b/fake/b");
     const cReq = post("/a/c/fake/c");
@@ -183,7 +183,7 @@ describe("single request at a time", () => {
     expect((await bAcq).body.granted).toBe(true);
     expect((await bReq).status).toBe(200);
     // a gets another message and re-queues behind c
-    const aAgain = control(base, "acquire", { agentId: "a" });
+    const aAgain = acquireUntilGranted(base, "a");
     await sleep(10);
     const st = await statusOf(base);
     expect(st.scheduler.queue).toEqual(["c", "a"]);
@@ -410,28 +410,41 @@ describe("streaming failures and client aborts", () => {
   });
 });
 
-describe("queue limits", () => {
-  it("returns 503 + Retry-After when the queue wait limit is exceeded", async () => {
+describe("queue and task limits", () => {
+  it("waiting in the queue never times out (only running time is limited)", async () => {
     up.handler = async (_r, res) => {
-      await sleep(400);
+      await sleep(300);
       res.writeHead(200).end("ok");
     };
-    await start({ queue: { maxWaitMs: 100 } });
+    await start({ task: { maxDurationMs: 200 } });
     const first = post("/a/first/fake/1");
     await sleep(20);
-    const second = await post("/a/second/fake/2");
-    expect(second.status).toBe(503);
-    expect(second.headers.get("retry-after")).toBe("30");
+    const second = await post("/a/second/fake/2"); // waits > maxDurationMs in line
+    expect(second.status).toBe(200);
     await first;
   });
 
-  it("task_expired (reject mode) yields 403 on the proxy path", async () => {
-    await start({ task: { maxDurationMs: 50, onMaxDuration: "reject" } });
+  it("task_expired yields 403 on the proxy path and the slot moves on", async () => {
+    await start({ task: { maxDurationMs: 50 } });
     await control(ctx!.base, "acquire", { agentId: "hog" });
-    await control(ctx!.base, "acquire", { agentId: "next" }).then(() => {}); // blocks until poll window
-    await sleep(120);
+    const next = await control(ctx!.base, "acquire", { agentId: "next" }); // granted once hog expires
+    expect(next.body.granted).toBe(true);
     const r = await post("/a/hog/fake/x");
     expect(r.status).toBe(403);
+    expect(up.seen).toHaveLength(0);
+  });
+
+  it("heartbeat tells an expired agent to stop, until it reports the task finished", async () => {
+    await start({ task: { maxDurationMs: 50 } });
+    const b = ctx!.base;
+    await control(b, "register", { agentId: "hog" });
+    await control(b, "acquire", { agentId: "hog" });
+    expect((await control(b, "heartbeat", { agentId: "hog" })).body.expired).toBe(false);
+    await sleep(120);
+    expect((await control(b, "heartbeat", { agentId: "hog" })).body.expired).toBe(true);
+    expect((await control(b, "acquire", { agentId: "hog" })).body).toMatchObject({ error: "task_expired" });
+    await control(b, "release", { agentId: "hog" });
+    expect((await control(b, "heartbeat", { agentId: "hog" })).body.expired).toBe(false);
   });
 });
 

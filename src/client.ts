@@ -11,6 +11,8 @@ export interface ClientOptions {
   /** Called with queue position while waiting for the slot. */
   onWaiting?: (info: { position: number; queueLength: number }) => void;
   onError?: (err: Error) => void;
+  /** The daemon terminated this agent's task (hard duration limit). */
+  onExpired?: () => void;
   /** Delay between reconnect attempts while the daemon is unreachable. */
   retryDelayMs?: number;
   /** Give up acquire() after the daemon has been unreachable this long (default 30s). */
@@ -82,7 +84,11 @@ export class PisyncClient {
     this.hb = setInterval(
       () => {
         this.post("heartbeat")
-          .then((r) => (r.status === 404 ? this.register() : undefined))
+          .then((r) => {
+            if (r.status === 404) return this.register();
+            if (r.body.expired === true) this.o.onExpired?.();
+            return undefined;
+          })
           .catch((e) => this.o.onError?.(e as Error));
       },
       Math.max(500, Math.floor(this.leaseMs / 3)),

@@ -8,15 +8,12 @@
   },
 
   "queue": {
-    "maxWaitMs": 10800000,
     "parentResume": "front",
     "maxRequestBodyBytes": 268435456
   },
 
   "task": {
     "maxDurationMs": 10800000,
-    "onMaxDuration": "requeue",
-    "activeIdleTimeoutMs": 0,
     "implicitIdleMs": 2000
   },
 

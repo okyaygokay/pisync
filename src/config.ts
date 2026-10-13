@@ -11,20 +11,18 @@ export interface PisyncConfig {
   /** pi provider name -> real upstream base URL. Providers listed here are routed through the daemon. */
   upstreams: Record<string, string>;
   queue: {
-    /** A task may wait in line at most this long (ms). 0 = unlimited. Default 3h. */
-    maxWaitMs: number;
     /** Where a parent that yielded to its sub-agents re-enters the queue. */
     parentResume: "front" | "tail";
     /** Max buffered request body (bytes). */
     maxRequestBodyBytes: number;
   };
   task: {
-    /** HARD LIMIT: a task may hold the slot at most this long (ms). 0 = unlimited. Default 3h. */
+    /**
+     * HARD LIMIT on how long a task may RUN (hold the slot, tool calls included).
+     * Waiting in the queue is unlimited and does not count. At the limit the task is
+     * terminated and the agent is aborted. 0 = unlimited. Default 3h.
+     */
     maxDurationMs: number;
-    /** What happens at the hard limit: move to the tail of the queue, or fail its requests. */
-    onMaxDuration: "requeue" | "reject";
-    /** Active task issuing no request for this long gets demoted. 0 = off. */
-    activeIdleTimeoutMs: number;
     /** Clients without the extension: a task ends this long after its last request. */
     implicitIdleMs: number;
   };
@@ -68,8 +66,8 @@ export const DEFAULT_CONFIG: PisyncConfig = {
     "openai-codex": "https://chatgpt.com/backend-api",
     openai: "https://api.openai.com/v1",
   },
-  queue: { maxWaitMs: 3 * HOUR, parentResume: "front", maxRequestBodyBytes: 256 * 1024 * 1024 },
-  task: { maxDurationMs: 3 * HOUR, onMaxDuration: "requeue", activeIdleTimeoutMs: 0, implicitIdleMs: 2000 },
+  queue: { parentResume: "front", maxRequestBodyBytes: 256 * 1024 * 1024 },
+  task: { maxDurationMs: 3 * HOUR, implicitIdleMs: 2000 },
   agent: { leaseMs: 30_000, pollMs: 20_000 },
   retry: {
     maxRetries: 25,
@@ -146,13 +144,10 @@ export function validate(c: PisyncConfig): string[] {
       p.push(`upstreams.${name} is not a valid URL`);
     }
   }
-  nonNeg("queue.maxWaitMs", c.queue.maxWaitMs);
   pos("queue.maxRequestBodyBytes", c.queue.maxRequestBodyBytes);
   if (c.queue.parentResume !== "front" && c.queue.parentResume !== "tail") p.push('queue.parentResume must be "front" or "tail"');
   nonNeg("task.maxDurationMs", c.task.maxDurationMs);
-  nonNeg("task.activeIdleTimeoutMs", c.task.activeIdleTimeoutMs);
   nonNeg("task.implicitIdleMs", c.task.implicitIdleMs);
-  if (c.task.onMaxDuration !== "requeue" && c.task.onMaxDuration !== "reject") p.push('task.onMaxDuration must be "requeue" or "reject"');
   pos("agent.leaseMs", c.agent.leaseMs);
   pos("agent.pollMs", c.agent.pollMs);
   if (c.agent.pollMs >= c.agent.leaseMs) p.push("agent.pollMs should be smaller than agent.leaseMs");

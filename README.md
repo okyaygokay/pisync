@@ -53,14 +53,17 @@ A master that spawns workers and waits for them would hold the slot while idle, 
 * Retrying is only possible until the first response byte has been forwarded. A stream that dies half-way cannot be replayed transparently; the connection to pi is cut and pi's own retry logic takes over.
 * A client that disconnects (pi aborted with Esc) cancels the upstream request and frees the slot immediately.
 
-### Hard limits (3 hours by default)
+### Hard limit (3 hours by default) - for a task's running time only
 
 | setting | default | meaning |
 |---|---|---|
-| `task.maxDurationMs` | 3 h | hard limit on how long **one task may hold the slot**. At the limit it is sent to the back of the queue (`onMaxDuration: "requeue"`) or its requests fail with HTTP 403 (`"reject"`) |
-| `queue.maxWaitMs` | 3 h | hard limit on how long a task may **wait in the queue**; afterwards its requests fail with `503` + `Retry-After` |
+| `task.maxDurationMs` | 3 h | hard limit on how long **one task may run**, i.e. hold the slot. Tool calls count as running time. At the limit the task is **terminated**: the slot passes to the next task, and the agent is aborted by the extension (pi's abort also stops a tool call that is still running). The task is never put back into the queue. |
 | `agent.leaseMs` | 30 s | an agent whose extension stops heartbeating (crash/kill -9) is reaped and its slot passed on |
-| `task.activeIdleTimeoutMs` | off | optional: demote an active task that issues no request for this long (hung tools) |
+
+* **Waiting in the queue has no time limit** and does not count towards the 3 hours. A task leaves the queue only by getting its turn, or by finishing/aborting.
+* Tool calls are part of the task: an active task keeps the slot while pi runs tools between requests, for as long as they take (up to the hard limit). There is no idle timeout.
+* A master waiting for its sub-agents is *suspended* (not running), so that time is not counted either; its clock resumes with the remaining budget.
+* After the limit the expired agent gets `403 pisync: task exceeded the hard limit` for any further request, and its next heartbeat (≤ 10 s) makes the extension call pi's abort. A new prompt starts a fresh task with a fresh clock.
 
 ## Install
 
@@ -88,7 +91,7 @@ Other env vars (extension): `PISYNC_URL` (daemon URL override), `PISYNC_DISABLE=
 All knobs live in the JSON config file; see [`pisync.config.example.json`](pisync.config.example.json) for every option with its default.
 
 * `upstreams` — pi provider name → real base URL. **Every provider listed here is routed through the daemon**, so list only the ones on your single-request plan. Add e.g. `"my-provider": "https://…"`. Keep the same path prefix pi would use (`…/v1` for OpenAI-compatible endpoints).
-* `retry.*`, `timeouts.*` (`connectMs`, `headersMs`, `idleMs`, `requestMs`), `queue.*`, `task.*`, `agent.*`, `listen.*`, `logLevel`.
+* `retry.*`, `timeouts.*` (`connectMs`, `headersMs`, `idleMs`, `requestMs`), `queue.parentResume`, `task.*`, `agent.*`, `listen.*`, `logLevel`.
 
 ## Operating it
 

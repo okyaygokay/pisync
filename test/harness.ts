@@ -110,3 +110,12 @@ export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 export async function statusOf(base: string): Promise<any> {
   return (await fetch(`${base}/_pisync/status`)).json();
 }
+
+/** Long-poll acquire until granted (a single poll may time out with granted:false). */
+export async function acquireUntilGranted(base: string, agentId: string, timeoutMs = 10_000) {
+  const t0 = Date.now();
+  for (;;) {
+    const r = await control(base, "acquire", { agentId });
+    if (r.body.granted === true || r.status !== 200 || Date.now() - t0 > timeoutMs) return r;
+  }
+}

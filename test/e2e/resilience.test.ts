@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createDaemon } from "../../src/daemon.ts";
 import { resolveConfig } from "../../src/config.ts";
 import { nullLogger } from "../../src/log.ts";
-import { HAVE_PI, Stack, waitFor, type Ctx } from "./stack.ts";
+import { HAVE_PI, Stack, piCmd, waitFor, type Ctx } from "./stack.ts";
 
 let s: Stack | undefined;
 afterEach(async () => {
@@ -183,48 +183,46 @@ describe.skipIf(!HAVE_PI)("e2e: crashes, aborts and limits", () => {
     expect((await b).code).toBe(0);
   }, 90_000);
 
-  it("hard task limit: a task hogging the slot past the limit is sent to the back, others proceed", async () => {
+  it("hard task limit terminates a runaway task: pi is aborted mid tool call, the next agent proceeds, the hog is NOT re-queued", async () => {
     s = await Stack.start({
-      daemon: { task: { maxDurationMs: 1500, onMaxDuration: "requeue" } },
-      behavior: (c: Ctx) => (c.final ? { kind: "text" } : { kind: "tool", command: c.who === "agent-hog" ? "sleep 4" : "true" }),
+      daemon: { task: { maxDurationMs: 1500 }, agent: { leaseMs: 1500, pollMs: 500 } },
+      behavior: (c: Ctx) => (c.final ? { kind: "text" } : { kind: "tool", command: c.who === "agent-hog" ? "sleep 60" : "true" }),
     });
+    const t0 = Date.now();
     const hog = s.runPi("agent-hog");
     await s.waitForTask("agent-hog");
     const other = s.runPi("agent-other");
     await s.waitForTask("agent-other");
-    const [rh, ro] = await Promise.all([hog, other]);
-    expect([rh.code, ro.code]).toEqual([0, 0]);
-    // other ran its whole task in the middle of the hog's task
-    expect(s.tasks()).toEqual(["agent-hog", "agent-other", "agent-hog"]);
-  }, 90_000);
-
-  it("hard task limit with onMaxDuration=reject: the hog's next request is refused, others proceed", async () => {
-    s = await Stack.start({
-      daemon: { task: { maxDurationMs: 1000, onMaxDuration: "reject" } },
-      behavior: (c: Ctx) => (c.final ? { kind: "text" } : { kind: "tool", command: c.who === "agent-hog" ? "sleep 3" : "true" }),
-    });
-    const hog = s.runPi("agent-hog");
-    await s.waitForTask("agent-hog");
-    const other = s.runPi("agent-other");
-    const [rh, ro] = await Promise.all([hog, other]);
+    const ro = await other;
     expect(ro.code).toBe(0);
-    expect(rh.code).not.toBe(0);
-    expect(s.requestsOf("agent-hog")).toHaveLength(1);
+    await hog; // the 60s sleep was cut short by the abort
+    expect(Date.now() - t0).toBeLessThan(30_000);
+    expect(s.requestsOf("agent-hog")).toHaveLength(1); // never got another turn
+    expect(s.tasks()).toEqual(["agent-hog", "agent-other"]);
+    expect(s.daemon.scheduler.snapshot().agents).toHaveLength(0);
   }, 90_000);
 
-  it("queue wait limit: an agent that waits too long gets an error instead of hanging forever", async () => {
+  it("time spent waiting in the queue does not count and never expires a task", async () => {
     s = await Stack.start({
-      daemon: { queue: { maxWaitMs: 1000 } },
-      behavior: (c: Ctx) => (c.final ? { kind: "text" } : { kind: "tool", command: c.who === "agent-slow" ? "sleep 4" : "true" }),
+      daemon: { task: { maxDurationMs: 4000 } },
+      behavior: (c: Ctx) => (c.final ? { kind: "text" } : { kind: "tool", command: c.who === "agent-first" ? "sleep 3" : "true" }),
     });
-    const slow = s.runPi("agent-slow");
-    await s.waitForTask("agent-slow");
-    const impatient = s.runPi("agent-impatient");
-    const [rs, ri] = await Promise.all([slow, impatient]);
-    expect(rs.code).toBe(0);
-    // impatient was refused by the queue timeout and aborted: it never sent a request and did not hang
-    expect(ri.code).not.toBeNull();
-    expect(s.requestsOf("agent-impatient")).toHaveLength(0);
+    const first = s.runPi("agent-first");
+    await s.waitForTask("agent-first");
+    const second = s.runPi("agent-second");
+    await s.waitForTask("agent-second");
+    const third = s.runPi("agent-third");
+    const rs = await Promise.all([first, second, third]);
+    expect(rs.map((r) => r.code)).toEqual([0, 0, 0]); // third waited > 4s in total, ran fine
+  }, 90_000);
+
+  it("a master's time suspended for its sub-agents does not count against its limit", async () => {
+    const behave = (c: Ctx) =>
+      c.final ? { kind: "text" as const } : { kind: "tool" as const, command: c.who === "agent-master" ? piCmd("agent-child") : "sleep 3" };
+    s = await Stack.start({ behavior: behave, daemon: { task: { maxDurationMs: 4000 } } });
+    const r = await s.runPi("agent-master"); // child runs 3s+ while master is suspended
+    expect(r.code).toBe(0);
+    expect(s.tasks()).toEqual(["agent-master", "agent-child", "agent-master"]);
   }, 90_000);
 
   it("daemon restart while an agent is queued and another is running: everyone still finishes", async () => {

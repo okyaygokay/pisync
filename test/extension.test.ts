@@ -29,12 +29,14 @@ interface MockPi {
   api: any;
   fire(name: string, ev?: any, c?: any): Promise<void>;
   ui: { setStatus: ReturnType<typeof vi.fn>; notify: ReturnType<typeof vi.fn> };
+  abort: ReturnType<typeof vi.fn>;
 }
 
 function mockPi(): MockPi {
   const handlers = new Map<string, Array<(e: any, c: any) => any>>();
   const providers: MockPi["providers"] = [];
   const ui = { setStatus: vi.fn(), notify: vi.fn() };
+  const abort = vi.fn();
   const api = {
     on: (n: string, h: (e: any, c: any) => any) => void (handlers.get(n) ?? handlers.set(n, []).get(n)!).push(h),
     registerProvider: (name: string, config: any) => void providers.push({ name, config }),
@@ -44,7 +46,8 @@ function mockPi(): MockPi {
     providers,
     api,
     ui,
-    async fire(name, ev = {}, c = { ui, signal: undefined }) {
+    abort,
+    async fire(name, ev = {}, c = { ui, signal: undefined, abort }) {
       for (const h of handlers.get(name) ?? []) await h(ev, c);
     },
   };
@@ -153,6 +156,34 @@ describe("task-level queueing across extension instances", () => {
   });
 });
 
+describe("hard task limit", () => {
+  it("aborts the run (even mid tool call) when the daemon terminates the task, once", async () => {
+    await ctx.daemon.close(50);
+    ctx = await startDaemon(up, { task: { maxDurationMs: 100 }, agent: { leaseMs: 900, pollMs: 200 } });
+    process.env.PISYNC_URL = ctx.base;
+    const a = await newAgent();
+    await a.fire("before_agent_start"); // granted; now a long tool call runs...
+    await sleep(1800); // heartbeats every 500ms notice the expiry
+    expect(a.abort).toHaveBeenCalledTimes(1);
+    expect(a.ui.notify).toHaveBeenCalledWith(expect.stringContaining("hard time limit"), "error");
+    // pi settles after the abort -> task reported finished -> flag cleared, a new task is allowed
+    await a.fire("agent_settled");
+    const again = probe(a.fire("before_agent_start"));
+    await again.promise;
+  });
+
+  it("a refused acquire (task expired) aborts the run instead of continuing", async () => {
+    await ctx.daemon.close(50);
+    ctx = await startDaemon(up, { task: { maxDurationMs: 60 } });
+    process.env.PISYNC_URL = ctx.base;
+    const a = await newAgent();
+    await a.fire("before_agent_start");
+    await sleep(150);
+    await expect(a.fire("turn_start")).rejects.toThrow();
+    expect(a.abort).toHaveBeenCalled();
+  });
+});
+
 describe("master / sub-agent discovery through the environment", () => {
   it("a child process env var links it to the master automatically", async () => {
     const master = await newAgent(); // sets PISYNC_PARENT_ID for processes it spawns
@@ -255,7 +286,7 @@ describe("client", () => {
 
   it("surfaces expiry as an AcquireError", async () => {
     await ctx.daemon.close(50);
-    ctx = await startDaemon(up, { task: { maxDurationMs: 40, onMaxDuration: "reject" } });
+    ctx = await startDaemon(up, { task: { maxDurationMs: 40 } });
     const c = new PisyncClient({ baseUrl: ctx.base, agentId: "greedy" });
     await c.acquire();
     await sleep(120);

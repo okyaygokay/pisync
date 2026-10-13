@@ -42,10 +42,7 @@ export function createDaemon(opts: DaemonOptions): Daemon {
   const scheduler = new Scheduler({
     parentResume: cfg.queue.parentResume,
     maxTaskDurationMs: cfg.task.maxDurationMs,
-    onMaxDuration: cfg.task.onMaxDuration,
-    maxQueueWaitMs: cfg.queue.maxWaitMs,
     implicitTaskIdleMs: cfg.task.implicitIdleMs,
-    activeIdleTimeoutMs: cfg.task.activeIdleTimeoutMs,
   });
   scheduler.onEvent((e) => {
     if (e.type === "granted" || e.type === "released") log.debug(e.type, { ...e });
@@ -204,7 +201,8 @@ export function createDaemon(opts: DaemonOptions): Daemon {
         case "heartbeat":
           if (!scheduler.hasAgent(id)) return json(res, 404, { error: "unknown_agent" });
           scheduler.touch(id);
-          return json(res, 200, { ok: true });
+          // `expired`: the task hit the hard limit; the extension aborts the run.
+          return json(res, 200, { ok: true, expired: scheduler.isExpired(id) });
         case "acquire": {
           // Self-healing: a restarted daemon learns the agent from the acquire itself.
           const known = scheduler.parentOf(id);

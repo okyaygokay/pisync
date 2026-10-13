@@ -11,9 +11,11 @@ import { LinkedQueue, type QueueNode } from "./linked-queue.ts";
  * - Exactly ONE task is *active* at a time. Only the active task may have a
  *   request in flight upstream. Everyone else waits in a FIFO queue.
  * - A task keeps the slot across many requests (and across tool executions
- *   between them) until it explicitly ends (`endTask`), is reaped, or hits the
- *   hard duration limit. A finished agent that gets a new prompt re-enters at
- *   the TAIL of the queue.
+ *   between them, however long) until it explicitly ends (`endTask`), its agent
+ *   is reaped, or it hits the hard duration limit (which TERMINATES the task:
+ *   it never goes back into the queue). Waiting in the queue has no time limit
+ *   and does not count towards the duration limit. A finished agent that gets
+ *   a new prompt re-enters at the TAIL of the queue.
  *
  * Hierarchy ("CEO" agents)
  * ------------------------
@@ -36,7 +38,6 @@ export type ErrorCode =
   | "aborted"
   | "task_ended"
   | "agent_gone"
-  | "queue_timeout"
   | "task_expired"
   | "shutdown";
 
@@ -52,25 +53,21 @@ export class SchedulerError extends Error {
 export interface SchedulerOptions {
   /** Where a suspended (yielded) parent re-enters when it resumes. */
   parentResume: "front" | "tail";
-  /** Hard limit for how long one task may hold the slot. 0 = unlimited. */
+  /**
+   * Hard limit on the time a task spends RUNNING (holding the slot). Queue time
+   * and time suspended for sub-agents do not count. At the limit the task is
+   * terminated: its waiters and later requests fail with task_expired until
+   * the agent reports the task finished. 0 = unlimited.
+   */
   maxTaskDurationMs: number;
-  /** What to do when the hard limit hits: send to the tail, or reject its requests. */
-  onMaxDuration: "requeue" | "reject";
-  /** Max time a task may wait in the queue before its waiters fail. 0 = unlimited. */
-  maxQueueWaitMs: number;
   /** Implicit (request-started) tasks end this long after their last request. */
   implicitTaskIdleMs: number;
-  /** An active task issuing no request for this long is demoted to the tail. 0 = off. */
-  activeIdleTimeoutMs: number;
 }
 
 export const DEFAULT_SCHEDULER_OPTIONS: SchedulerOptions = {
   parentResume: "front",
   maxTaskDurationMs: 3 * 60 * 60 * 1000,
-  onMaxDuration: "requeue",
-  maxQueueWaitMs: 3 * 60 * 60 * 1000,
   implicitTaskIdleMs: 2000,
-  activeIdleTimeoutMs: 0,
 };
 
 export type SchedulerEvent =
@@ -78,8 +75,7 @@ export type SchedulerEvent =
   | { type: "activated"; agent: string; waitedMs: number }
   | { type: "suspended"; agent: string; reason: "descendant-queued" }
   | { type: "ended"; agent: string; heldMs: number }
-  | { type: "demoted"; agent: string; reason: "max-duration" | "idle" }
-  | { type: "rejected"; agent: string; reason: "max-duration" | "queue-timeout" }
+  | { type: "expired"; agent: string; ranMs: number }
   | { type: "granted"; agent: string }
   | { type: "released"; agent: string; heldMs: number }
   | { type: "registered"; agent: string; parent: string | null }
@@ -120,6 +116,8 @@ class Agent {
   /** Task begun through acquire/waitActive (extension) rather than a bare request. */
   explicit = false;
   expired = false;
+  /** Time spent holding the slot so far in this task (excludes queueing / suspension). */
+  usedMs = 0;
   qNode: QueueNode<Agent> | null = null;
   /** Number of queued agents strictly below this one in the tree (O(1) yield check). */
   queuedSub = 0;
@@ -134,9 +132,7 @@ class Agent {
   leaseMs = 0;
 
   durationTimer: NodeJS.Timeout | null = null;
-  queueTimer: NodeJS.Timeout | null = null;
   implicitTimer: NodeJS.Timeout | null = null;
-  idleTimer: NodeJS.Timeout | null = null;
   leaseTimer: NodeJS.Timeout | null = null;
 
   tasksRun = 0;
@@ -418,6 +414,7 @@ export class Scheduler {
       this.active = null;
       this.emit({ type: "ended", agent: a.id, heldMs: Date.now() - a.activeSince });
     }
+    a.usedMs = 0;
     if (wasLive) this.totals.tasksEnded++;
     a.state = "idle";
     a.explicit = false;
@@ -445,17 +442,6 @@ export class Scheduler {
     a.queuedSince = Date.now();
     if (!resumed && !continuation) this.totals.tasksStarted++;
     this.queuePush(a, resumed && this.opts.parentResume === "front");
-    if (this.opts.maxQueueWaitMs > 0) {
-      a.queueTimer = setTimeout(() => {
-        a.queueTimer = null;
-        if (a.state !== "queued") return;
-        this.emit({ type: "rejected", agent: a.id, reason: "queue-timeout" });
-        this.endTaskInternal(a, new SchedulerError("queue_timeout", `waited more than ${this.opts.maxQueueWaitMs}ms`));
-        this.gcImplicit(a);
-        this.dispatch();
-      }, this.opts.maxQueueWaitMs);
-      a.queueTimer.unref?.();
-    }
     this.emit({ type: "queued", agent: a.id, position: this.queue.size, resumed });
   }
 
@@ -475,10 +461,6 @@ export class Scheduler {
     if (a.implicitTimer) {
       clearTimeout(a.implicitTimer);
       a.implicitTimer = null;
-    }
-    if (a.idleTimer) {
-      clearTimeout(a.idleTimer);
-      a.idleTimer = null;
     }
     this.enterQueue(a);
     return new Promise<() => void>((resolve, reject) => {
@@ -531,7 +513,6 @@ export class Scheduler {
       this.emit({ type: "released", agent: a.id, heldMs: held });
       if (this.agents.get(a.id) === a) {
         if (!a.explicit && a.reqs.size === 0) this.armImplicitEnd(a);
-        else if (this.active === a && a.reqs.size === 0) this.armIdle(a);
         this.gcImplicit(a);
       }
       this.dispatch();
@@ -581,10 +562,6 @@ export class Scheduler {
         this.inFlightSince = Date.now();
         a.requestsGranted++;
         this.totals.requestsGranted++;
-        if (a.idleTimer) {
-          clearTimeout(a.idleTimer);
-          a.idleTimer = null;
-        }
         this.emit({ type: "granted", agent: a.id });
         w.resolve(this.releaseFor(a));
       }
@@ -597,16 +574,13 @@ export class Scheduler {
 
   private suspend(a: Agent): void {
     this.active = null;
+    a.usedMs += Date.now() - a.activeSince;
     a.state = "suspended";
     this.clearTaskTimers(a);
     this.emit({ type: "suspended", agent: a.id, reason: "descendant-queued" });
   }
 
   private activate(a: Agent): void {
-    if (a.queueTimer) {
-      clearTimeout(a.queueTimer);
-      a.queueTimer = null;
-    }
     const now = Date.now();
     const waited = now - a.queuedSince;
     a.totalQueueWaitMs += waited;
@@ -615,10 +589,10 @@ export class Scheduler {
     a.activeSince = now;
     this.active = a;
     if (this.opts.maxTaskDurationMs > 0) {
-      a.durationTimer = setTimeout(() => this.onMaxDuration(a), this.opts.maxTaskDurationMs);
+      const remaining = Math.max(0, this.opts.maxTaskDurationMs - a.usedMs);
+      a.durationTimer = setTimeout(() => this.expire(a), remaining);
       a.durationTimer.unref?.();
     }
-    if (a.reqs.size === 0) this.armIdle(a);
     this.emit({ type: "activated", agent: a.id, waitedMs: waited });
     for (const w of [...a.activeWaiters]) {
       w.cleanup();
@@ -626,44 +600,25 @@ export class Scheduler {
     }
   }
 
-  private armIdle(a: Agent): void {
-    if (this.opts.activeIdleTimeoutMs <= 0 || a.idleTimer) return;
-    a.idleTimer = setTimeout(() => {
-      a.idleTimer = null;
-      if (this.active === a && a.reqs.size === 0 && !a.inFlight) this.demote(a, "idle");
-    }, this.opts.activeIdleTimeoutMs);
-    a.idleTimer.unref?.();
-  }
-
-  private onMaxDuration(a: Agent): void {
+  /** Hard limit reached: terminate the task. Its slot passes on; it never re-queues. */
+  private expire(a: Agent): void {
     a.durationTimer = null;
     if (this.active !== a) return;
-    if (this.opts.onMaxDuration === "reject") {
-      this.emit({ type: "rejected", agent: a.id, reason: "max-duration" });
-      this.endTaskInternal(a, new SchedulerError("task_expired", `task of ${a.id} exceeded the hard limit`));
-      a.expired = true;
-      this.dispatch();
-    } else {
-      this.demote(a, "max-duration");
-    }
+    const ranMs = a.usedMs + (Date.now() - a.activeSince);
+    this.emit({ type: "expired", agent: a.id, ranMs });
+    this.endTaskInternal(a, new SchedulerError("task_expired", `task of ${a.id} exceeded the hard limit`));
+    a.expired = true;
+    this.dispatch();
   }
 
-  /** Active -> tail of the queue (keeps waiters/requests; they resume later). */
-  private demote(a: Agent, reason: "max-duration" | "idle"): void {
-    if (this.active !== a) return;
-    this.active = null;
-    a.state = "idle"; // re-enters at the tail as a continuation of the same task
-    this.clearTaskTimers(a);
-    this.totals.demotions++;
-    this.emit({ type: "demoted", agent: a.id, reason });
-    this.enterQueue(a, true);
-    this.dispatch();
+  isExpired(id: string): boolean {
+    return this.agents.get(id)?.expired ?? false;
   }
 
   // ---------------------------------------------------------------- timers
 
   private clearTaskTimers(a: Agent): void {
-    for (const k of ["durationTimer", "queueTimer", "implicitTimer", "idleTimer"] as const) {
+    for (const k of ["durationTimer", "implicitTimer"] as const) {
       const t = a[k];
       if (t) {
         clearTimeout(t);

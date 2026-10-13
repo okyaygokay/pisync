@@ -378,98 +378,150 @@ describe("hierarchy: master (CEO) and sub-agents", () => {
   });
 });
 
-describe("hard limits and timeouts", () => {
-  it("max task duration (requeue) sends the long task to the tail", async () => {
-    mk({ maxTaskDurationMs: 1000, onMaxDuration: "requeue" });
+describe("hard task duration limit (running time only)", () => {
+  const H = 3 * 3600_000;
+
+  it("default is 3 hours", () => {
+    mk();
+    expect(s.opts.maxTaskDurationMs).toBe(H);
+  });
+
+  it("terminates a task that runs too long: the slot passes on and the task does NOT re-queue", async () => {
+    mk({ maxTaskDurationMs: 1000 });
     const events: SchedulerEvent[] = [];
     s.onEvent((e) => events.push(e));
     await s.waitActive("a");
     const b = probe(s.waitActive("b"));
     await vi.advanceTimersByTimeAsync(1001);
     expect(b.value).toBe(true);
-    expect(s.snapshot().queue).toEqual(["a"]);
-    expect(events.some((e) => e.type === "demoted")).toBe(true);
+    expect(s.snapshot().queue).toEqual([]);
+    expect(s.stateOf("a")).toBe("idle");
+    expect(s.isExpired("a")).toBe(true);
+    expect(events.some((e) => e.type === "expired")).toBe(true);
   });
 
-  it("max task duration (requeue) with nobody else waiting just re-activates", async () => {
+  it("long tool calls (no requests at all) count as running time and are cut at the limit", async () => {
+    mk({ maxTaskDurationMs: H });
+    await s.waitActive("a");
+    const rel = await s.acquireRequest("a");
+    rel();
+    const b = probe(s.waitActive("b"));
+    await vi.advanceTimersByTimeAsync(H - 1000); // a tool call that runs almost 3h
+    expect(b.settled).toBe(false);
+    expect(s.isActive("a")).toBe(true);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(b.value).toBe(true);
+  });
+
+  it("an expired task's waiters and later requests fail with task_expired until the task is reported finished", async () => {
     mk({ maxTaskDurationMs: 1000 });
     await s.waitActive("a");
     await vi.advanceTimersByTimeAsync(1001);
-    expect(s.isActive("a")).toBe(true);
-  });
-
-  it("max task duration (reject) fails the agent's later requests with task_expired", async () => {
-    mk({ maxTaskDurationMs: 1000, onMaxDuration: "reject" });
-    await s.waitActive("a");
-    const pend = probe(s.acquireRequest("a")); // granted immediately
-    await flush();
-    pend.value!();
-    const b = probe(s.waitActive("b"));
-    await vi.advanceTimersByTimeAsync(1001);
-    expect(b.value).toBe(true);
     await expect(s.acquireRequest("a")).rejects.toMatchObject({ code: "task_expired" });
     await expect(s.waitActive("a")).rejects.toMatchObject({ code: "task_expired" });
-    s.endTask("a"); // clears the flag
+    s.endTask("a"); // agent aborted and settled
+    expect(s.isExpired("a")).toBe(false);
     const a2 = probe(s.waitActive("a"));
     await flush();
-    expect(a2.settled).toBe(false); // legitimately queued again
+    expect(a2.value).toBe(true); // brand-new task, fresh clock
   });
 
-  it("queue wait timeout fails the waiter and frees its place", async () => {
-    mk({ maxQueueWaitMs: 5000 });
+  it("a pending request of the expired task is rejected too; one already in flight finishes normally", async () => {
+    mk({ maxTaskDurationMs: 1000 });
     await s.waitActive("a");
-    const b = probe(s.waitActive("b"));
-    const r = probe(s.acquireRequest("b"));
-    await vi.advanceTimersByTimeAsync(5001);
-    expect((b.error as SchedulerError).code).toBe("queue_timeout");
-    expect((r.error as SchedulerError).code).toBe("queue_timeout");
-    expect(s.snapshot().queue).toEqual([]);
-  });
-
-  it("active-idle timeout demotes a hung task", async () => {
-    mk({ activeIdleTimeoutMs: 1000, maxTaskDurationMs: 0 });
-    await s.waitActive("a");
-    const b = probe(s.waitActive("b"));
+    const inflight = await s.acquireRequest("a");
+    const pending = probe(s.acquireRequest("a"));
     await vi.advanceTimersByTimeAsync(1001);
-    expect(b.value).toBe(true);
-    expect(s.snapshot().queue).toEqual(["a"]);
+    expect((pending.error as SchedulerError).code).toBe("task_expired");
+    const b = probe(s.acquireRequest("b"));
+    await flush();
+    expect(b.settled).toBe(false); // global one-in-flight rule still holds
+    inflight();
+    await flush();
+    expect(b.settled).toBe(true);
   });
 
-  it("active-idle timer is cancelled by activity", async () => {
-    mk({ activeIdleTimeoutMs: 1000, maxTaskDurationMs: 0 });
+  it("waiting in the queue is unlimited and does not eat into the task's time", async () => {
+    const HR = 3600_000;
+    mk({ maxTaskDurationMs: HR });
     await s.waitActive("a");
-    const b = probe(s.waitActive("b"));
-    await vi.advanceTimersByTimeAsync(900);
-    const rel = await s.acquireRequest("a");
-    await vi.advanceTimersByTimeAsync(5000); // in flight, long response
-    expect(b.settled).toBe(false);
-    rel();
-    await vi.advanceTimersByTimeAsync(900);
-    expect(b.settled).toBe(false);
+    bg(s.waitActive("b"));
+    const c = probe(s.waitActive("c"));
+    await vi.advanceTimersByTimeAsync(50 * 60_000);
+    s.endTask("a"); // a finished after 50 min
+    await vi.advanceTimersByTimeAsync(50 * 60_000);
+    s.endTask("b"); // b finished after 50 min; c has now waited 100 min > limit
+    await flush();
+    expect(c.value).toBe(true);
+    await vi.advanceTimersByTimeAsync(50 * 60_000);
+    expect(s.isExpired("c")).toBe(false);
+    expect(s.isActive("c")).toBe(true);
+  });
+
+  it("time suspended while sub-agents work does not count; the clock resumes with the remaining budget", async () => {
+    mk({ maxTaskDurationMs: 1000 });
+    s.registerAgent("m");
+    s.registerAgent("c", { parentId: "m" });
+    await s.waitActive("m");
+    await vi.advanceTimersByTimeAsync(600); // master ran 600ms
+    bg(s.waitActive("c")); // master yields
+    await flush();
+    expect(s.stateOf("m")).toBe("suspended");
+    await vi.advanceTimersByTimeAsync(5000); // child works for ages
+    expect(s.isExpired("m")).toBe(false);
+    s.endTask("c");
+    const m2 = probe(s.acquireRequest("m"));
+    await flush();
+    expect(m2.settled).toBe(true);
+    await vi.advanceTimersByTimeAsync(300);
+    expect(s.isExpired("m")).toBe(false); // 900ms used
     await vi.advanceTimersByTimeAsync(200);
-    expect(b.value).toBe(true);
+    expect(s.isExpired("m")).toBe(true); // 1100ms > 1000ms
   });
 
-  it("limits of 0 disable the timers", async () => {
-    mk({ maxTaskDurationMs: 0, maxQueueWaitMs: 0, activeIdleTimeoutMs: 0 });
+  it("ending the task before the limit cancels the timer and resets the clock", async () => {
+    mk({ maxTaskDurationMs: 1000 });
+    await s.waitActive("a");
+    await vi.advanceTimersByTimeAsync(800);
+    s.endTask("a");
+    await s.waitActive("a"); // new task: full budget again
+    await vi.advanceTimersByTimeAsync(800);
+    expect(s.isExpired("a")).toBe(false);
+  });
+
+  it("an active task is never demoted for being idle between requests (tool calls can take hours)", async () => {
+    mk({ maxTaskDurationMs: 0 });
     await s.waitActive("a");
     const b = probe(s.waitActive("b"));
-    await vi.advanceTimersByTimeAsync(10 * 3600_000);
+    for (let i = 0; i < 5; i++) {
+      const rel = await s.acquireRequest("a");
+      rel();
+      await vi.advanceTimersByTimeAsync(2 * 3600_000); // two hour tool call
+    }
     expect(b.settled).toBe(false);
     expect(s.isActive("a")).toBe(true);
   });
 
-  it("default hard limit is 3 hours", async () => {
-    mk();
-    expect(s.opts.maxTaskDurationMs).toBe(3 * 3600_000);
+  it("limit 0 disables the timer", async () => {
+    mk({ maxTaskDurationMs: 0 });
     await s.waitActive("a");
     const b = probe(s.waitActive("b"));
-    await vi.advanceTimersByTimeAsync(3 * 3600_000 - 1000);
+    await vi.advanceTimersByTimeAsync(100 * 3600_000);
+    expect(b.settled).toBe(false);
+    expect(s.isActive("a")).toBe(true);
+  });
+
+  it("default limit fires at exactly 3 hours", async () => {
+    mk();
+    await s.waitActive("a");
+    const b = probe(s.waitActive("b"));
+    await vi.advanceTimersByTimeAsync(H - 1000);
     expect(b.settled).toBe(false);
     await vi.advanceTimersByTimeAsync(2000);
     expect(b.value).toBe(true);
   });
 });
+
 
 describe("leases and implicit tasks", () => {
   it("an agent that stops heartbeating is reaped and the slot passes on", async () => {
@@ -587,7 +639,7 @@ describe("invariants under random operations", () => {
   }
 
   it.each([1, 2, 3, 4, 5, 6, 7, 8])("seed %i: one active, one in flight, queue consistent", async (seed) => {
-    mk({ maxTaskDurationMs: 0, maxQueueWaitMs: 0, implicitTaskIdleMs: 50 });
+    mk({ maxTaskDurationMs: 0, implicitTaskIdleMs: 50 });
     const rand = rng(seed);
     const ids = Array.from({ length: 12 }, (_, i) => `n${i}`);
     // random tree
@@ -628,7 +680,7 @@ describe("invariants under random operations", () => {
   });
 
   it("liveness: with a master/worker tree and random completion order everything finishes", async () => {
-    mk({ maxTaskDurationMs: 0, maxQueueWaitMs: 0 });
+    mk({ maxTaskDurationMs: 0 });
     const rand = rng(42);
     s.registerAgent("m");
     const workers = Array.from({ length: 10 }, (_, i) => `w${i}`);
@@ -656,7 +708,7 @@ describe("invariants under random operations", () => {
 describe("performance", () => {
   it("handles 20k task cycles quickly (O(1) queue ops)", async () => {
     vi.useRealTimers();
-    mk({ maxTaskDurationMs: 0, maxQueueWaitMs: 0 });
+    mk({ maxTaskDurationMs: 0 });
     const N = 20_000;
     const t0 = performance.now();
     const waits: Array<Promise<boolean>> = [];
@@ -672,7 +724,7 @@ describe("performance", () => {
 
   it("deep queues stay cheap when no hierarchy is involved", async () => {
     vi.useRealTimers();
-    mk({ maxTaskDurationMs: 0, maxQueueWaitMs: 0 });
+    mk({ maxTaskDurationMs: 0 });
     for (let i = 0; i < 5000; i++) s.waitActive(`q${i}`);
     const t0 = performance.now();
     for (let i = 0; i < 5000; i++) {

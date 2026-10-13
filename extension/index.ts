@@ -49,6 +49,10 @@ export default function pisync(pi: ExtensionAPI) {
 
   let client: PisyncClient | null = null;
   let setStatus: ((text: string | undefined) => void) | undefined;
+  // Latest pi context we can use to abort a run from a background callback.
+  let abortRun: (() => void) | undefined;
+  let notify: ((m: string, t?: "info" | "warning" | "error") => void) | undefined;
+  let expiredHandled = false;
 
   const ensureClient = (): PisyncClient => {
     if (client) return client;
@@ -60,6 +64,14 @@ export default function pisync(pi: ExtensionAPI) {
       ...(process.env.PISYNC_OUTAGE_MS ? { maxOutageMs: Number(process.env.PISYNC_OUTAGE_MS) } : {}),
       label: process.env.PISYNC_LABEL ?? `pi:${process.cwd().split("/").pop()}`,
       onWaiting: ({ position, queueLength }) => setStatus?.(`pisync: waiting (#${position} of ${queueLength})`),
+      onExpired: () => {
+        // Hard time limit: the daemon already gave the slot away. Stop the agent,
+        // including any tool call that is still running.
+        if (expiredHandled) return;
+        expiredHandled = true;
+        notify?.("pisync: this task exceeded the hard time limit and was terminated", "error");
+        abortRun?.();
+      },
       onError: () => {
         /* daemon hiccups are retried; surfaced via status only */
       },
@@ -69,6 +81,8 @@ export default function pisync(pi: ExtensionAPI) {
 
   const acquire = async (ctx: { signal?: AbortSignal; abort?: () => void; ui: { setStatus(k: string, t: string | undefined): void; notify(m: string, t?: "info" | "warning" | "error"): void } }) => {
     setStatus = (t) => ctx.ui.setStatus("pisync", t);
+    notify = (m, t) => ctx.ui.notify(m, t);
+    abortRun = () => ctx.abort?.();
     try {
       await ensureClient().acquire(ctx.signal);
       setStatus(undefined);
@@ -86,6 +100,8 @@ export default function pisync(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_e, ctx) => {
     setStatus = (t) => ctx.ui.setStatus("pisync", t);
+    notify = (m, t) => ctx.ui.notify(m, t);
+    abortRun = () => ctx.abort();
     // Sub-agents spawned from here on (bash, subprocesses, RPC children...) inherit this.
     process.env[PARENT_ENV] = agentId;
     try {
@@ -101,12 +117,13 @@ export default function pisync(pi: ExtensionAPI) {
   });
 
   // A task spans many turns; the daemon may have suspended us while sub-agents
-  // ran, or demoted us at the hard limit. Re-check cheaply before each turn.
+  // ran, or terminated the task at the hard limit. Re-check cheaply before each turn.
   pi.on("turn_start", async (_e, ctx) => {
     await acquire(ctx);
   });
 
   pi.on("agent_settled", async () => {
+    expiredHandled = false;
     await client?.release();
   });
 
